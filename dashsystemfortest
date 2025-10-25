@@ -1,0 +1,706 @@
+--[[
+    ═══════════════════════════════════════════════════════════════
+   DASH SYSTEM
+    ═══════════════════════════════════════════════════════════════
+    |
+   \ /
+   
+    Features:
+    - Forward, Backward, and Side dashes with unique physics
+    - Dynamic velocity decay systems
+    - Health-based dash cancellation
+    - Procedural visual effects (highlights, particles, shockwaves)
+    - Real-time hitbox collision detection
+    - CFrame mathematics for positioning and rotation
+    - Metatable-based OOP architecture
+    - Ground-based rock debris system
+    - Limb trail effects
+    
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local DashSystem = {} -- creates the main module table to be returned
+DashSystem.__index = DashSystem -- sets metatable __index to self for OOP inheritance
+
+local TweenService = game:GetService("TweenService") -- gets TweenService for smooth property animations
+local Debris = game:GetService("Debris") -- gets Debris service to auto-destroy instances after delay
+local RunService = game:GetService("RunService") -- gets RunService for accessing game loop events
+local Workspace = game:GetService("Workspace") -- gets Workspace where all 3D instances exist
+
+local DASH_CONFIG = { -- table storing configuration values for all dash types
+    Front = { -- configuration for forward dashes
+        InitialVelocity = 120, -- starting speed in studs per second
+        Deceleration = 7, -- velocity reduction per iteration (studs/second)
+        MinVelocity = 7, -- threshold for switching to slower deceleration
+        Duration = 0.77, -- total duration of visual effects in seconds
+        CancelWindow = 0.44 -- time window in seconds where damage cancels dash
+    },
+    Backward = { -- configuration for backward dashes
+        InitialVelocity = 100, -- starting speed in studs per second
+        SecondPhaseVelocity = 80, -- velocity after animation marker trigger
+        Deceleration = 7.5, -- velocity reduction per iteration
+        Duration = 0.5, -- total VFX duration in seconds
+        CancelWindow = 0.44 -- damage cancellation window in seconds
+    },
+    Side = { -- configuration for left/right side dashes
+        InitialVelocity = 100, -- starting speed in studs per second
+        Deceleration = 7.5, -- velocity reduction per iteration
+        Duration = 0.3, -- total VFX duration in seconds
+        CancelWindow = 0.44 -- damage cancellation window in seconds
+    }
+}
+
+local VFX_CONFIG = { -- table storing visual effect configuration
+    HighlightDuration = 0.75, -- duration of character highlight effect in seconds
+    SmokePollRate = 0.075, -- time interval between smoke particle spawns in seconds
+    TrailDuration = 0.6, -- duration limb trails remain visible in seconds
+    ParticleEmitCount = 20 -- number of particles to emit per smoke burst
+}
+
+local HITBOX_CONFIG = { -- table storing hitbox detection configuration
+    Size = Vector3.new(5.9, 6, 6.05), -- dimensions of hitbox in studs (width, height, depth)
+    Transparency = 1, -- transparency level (1 = completely invisible)
+    Lifetime = 0.7, -- duration hitbox remains active in seconds
+    Offset = CFrame.new(0, 0, -3.5) -- positional offset from character (forward by 3.5 studs)
+}
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    UTILITY FUNCTIONS
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local function createTween(instance, duration, properties, easingStyle)
+    local tweenInfo = TweenInfo.new(duration, easingStyle or Enum.EasingStyle.Quad) -- creates TweenInfo with duration and easing style (defaults to Quad)
+    local tween = TweenService:Create(instance, tweenInfo, properties) -- creates a Tween object targeting the instance with specified properties
+    tween:Play() -- immediately starts playing the tween animation
+    return tween -- returns the Tween object for potential further manipulation
+end
+
+local function createRaycastParams(filterType, filterInstances)
+    local params = RaycastParams.new() -- creates a new RaycastParams object for configuring raycasts
+    params.FilterType = filterType -- sets whether to include or exclude filtered instances
+    params.FilterDescendantsInstances = filterInstances -- sets which instances to filter in the raycast
+    return params -- returns the configured RaycastParams object
+end
+
+local function createOverlapParams(filterInstances)
+    local params = OverlapParams.new() -- creates a new OverlapParams object for spatial queries
+    params.FilterType = Enum.RaycastFilterType.Exclude -- sets filter to exclude mode (blacklist)
+    params.FilterDescendantsInstances = filterInstances -- sets which instances to exclude from spatial query
+    return params -- returns the configured OverlapParams object
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    LIMB TRAIL SYSTEM
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local LimbTrailSystem = {} -- creates the LimbTrailSystem class table
+LimbTrailSystem.__index = LimbTrailSystem -- sets metatable __index for OOP
+
+function LimbTrailSystem.createTrail(limb, duration)
+    local attachment0 = Instance.new("Attachment") -- creates first Attachment for trail endpoint
+    attachment0.Name = "TrailAttachment0" -- sets name for identification
+    attachment0.Position = Vector3.new(0, 0.5, 0) -- positions attachment 0.5 studs above limb center
+    attachment0.Parent = limb -- parents attachment to the limb part
+
+    local attachment1 = Instance.new("Attachment") -- creates second Attachment for trail other endpoint
+    attachment1.Name = "TrailAttachment1" -- sets name for identification
+    attachment1.Position = Vector3.new(0, -0.5, 0) -- positions attachment 0.5 studs below limb center
+    attachment1.Parent = limb -- parents attachment to the limb part
+
+    local trail = Instance.new("Trail") -- creates a Trail instance for visual effect
+    trail.Attachment0 = attachment0 -- connects trail to first attachment point
+    trail.Attachment1 = attachment1 -- connects trail to second attachment point
+    trail.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255)) -- sets trail color to white
+    trail.Transparency = NumberSequence.new({ -- creates transparency gradient over trail length
+        NumberSequenceKeypoint.new(0, 0.5), -- 50% transparent at start
+        NumberSequenceKeypoint.new(1, 1) -- 100% transparent at end (fade out)
+    })
+    trail.Lifetime = 0.3 -- sets how long each trail segment exists in seconds
+    trail.MinLength = 0.1 -- minimum length required before trail appears (studs)
+    trail.FaceCamera = true -- makes trail always face the camera for better visibility
+    trail.Parent = limb -- parents trail to the limb part
+
+    Debris:AddItem(attachment0, duration) -- schedules first attachment for destruction after duration
+    Debris:AddItem(attachment1, duration) -- schedules second attachment for destruction after duration
+    Debris:AddItem(trail, duration) -- schedules trail for destruction after duration
+
+    return trail -- returns the Trail object for potential further use
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    ROCK DEBRIS SYSTEM (SideRock2 Implementation)
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local RockDebrisSystem = {} -- creates the RockDebrisSystem class table
+RockDebrisSystem.__index = RockDebrisSystem -- sets metatable __index for OOP
+
+function RockDebrisSystem.SideRock2(cf, direction, spread, size, lifetime)
+    local rayparams = RaycastParams.new() -- creates RaycastParams for ground detection
+    rayparams.FilterType = Enum.RaycastFilterType.Include -- sets filter to whitelist mode
+    rayparams.FilterDescendantsInstances = {Workspace:FindFirstChild("Map") or Workspace} -- only detects Map objects (or Workspace if Map doesn't exist)
+
+    local angle = 180 -- initializes angle to 180 degrees for positioning rocks on sides
+
+    for i = 1, 2 do -- loops twice to create rocks on both sides
+        local resultcf = cf * CFrame.Angles(0, math.rad(angle), 0) * CFrame.new(spread, 0, 0) -- calculates position by rotating angle degrees and offsetting by spread studs
+        local result = Workspace:Raycast(resultcf.Position, direction, rayparams) -- performs raycast downward to find ground
+
+        if result then -- checks if raycast hit something (ground detected)
+            local part = Instance.new("Part") -- creates a new Part for the rock
+            part.Name = "RockDebris" -- sets name for identification
+            part.Transparency = 0 -- sets part to fully opaque (visible)
+            part.CanCollide = false -- disables collision to prevent physics interference
+            part.CFrame = CFrame.new(result.Position) * CFrame.Angles( -- positions rock at hit location with random rotation
+                math.rad(math.random(-360, 360)), -- random X-axis rotation between -360 and 360 degrees
+                math.rad(math.random(-360, 360)), -- random Y-axis rotation between -360 and 360 degrees
+                math.rad(math.random(-360, 360)) -- random Z-axis rotation between -360 and 360 degrees
+            )
+            part.Size = Vector3.new(size, size, size) -- sets rock size to cubic dimensions
+            part.Material = result.Instance.Material -- matches rock material to ground material
+            part.BrickColor = result.Instance.BrickColor -- matches rock color to ground color
+            part.Anchored = true -- anchors rock in place (no physics movement)
+            part.Parent = Workspace:FindFirstChild("Debris") or Workspace -- parents to Debris folder or Workspace
+
+            task.delay(lifetime, function() -- schedules a delayed function after lifetime seconds
+                TweenService:Create(part, TweenInfo.new(0.5), { -- creates tween to animate rock sinking
+                    Position = part.Position - Vector3.new(0, part.Size.Y, 0) -- moves rock downward by its height
+                }):Play() -- plays the sinking animation
+                Debris:AddItem(part, 0.5) -- schedules rock for destruction after animation completes
+            end)
+
+            angle = angle + 180 -- increments angle by 180 degrees for opposite side
+            if angle > 360 then -- checks if angle exceeded 360 degrees
+                angle = 180 -- resets angle back to 180 degrees
+            end
+        end
+    end
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    VFX MANAGER CLASS
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local VFXManager = {} -- creates the VFXManager class table
+VFXManager.__index = VFXManager -- sets metatable __index for OOP
+
+function VFXManager.new()
+    local self = setmetatable({}, VFXManager) -- creates new instance with VFXManager as metatable
+    return self -- returns the new VFXManager instance
+end
+
+function VFXManager:createHighlight(character, duration)
+    local highlight = Instance.new("Highlight") -- creates a Highlight instance for visual emphasis
+    highlight.FillColor = Color3.fromRGB(255, 255, 255) -- sets fill color to white (RGB 255, 255, 255)
+    highlight.OutlineColor = Color3.fromRGB(0, 0, 0) -- sets outline color to black (RGB 0, 0, 0)
+    highlight.FillTransparency = 0 -- sets fill to fully opaque (0 = no transparency)
+    highlight.OutlineTransparency = 0 -- sets outline to fully opaque
+    highlight.Parent = character -- parents highlight to character model to affect entire character
+
+    createTween(highlight, duration, { -- creates fade-out tween over specified duration
+        FillTransparency = 1, -- tweens fill from 0 to 1 (fully transparent)
+        OutlineTransparency = 1 -- tweens outline from 0 to 1 (fully transparent)
+    })
+
+    Debris:AddItem(highlight, duration) -- schedules highlight for destruction after duration expires
+end
+
+function VFXManager:createGroundSmoke(rootPart)
+    local rayParams = createRaycastParams( -- creates raycast parameters for ground detection
+        Enum.RaycastFilterType.Include, -- sets to whitelist mode
+        {Workspace:FindFirstChild("Map") or Workspace} -- only detects Map or Workspace objects
+    )
+    local rayResult = Workspace:Raycast(rootPart.Position, Vector3.new(0, -5, 0), rayParams) -- casts ray 5 studs downward from character position
+
+    if rayResult then -- checks if ray hit ground
+        local smokePart = Instance.new("Part") -- creates Part to hold particle emitters
+        smokePart.Name = "SmokePart" -- sets name for identification
+        smokePart.Size = Vector3.new(4, 0.1, 4) -- sets size to flat 4x4 stud square
+        smokePart.Transparency = 1 -- makes part invisible (only particles visible)
+        smokePart.Anchored = true -- anchors part in place
+        smokePart.CanCollide = false -- disables collision
+        smokePart.Position = rayResult.Position -- positions at ground hit location
+        smokePart.Parent = Workspace:FindFirstChild("Debris") or Workspace -- parents to Debris or Workspace
+
+        local particleEmitter = Instance.new("ParticleEmitter") -- creates ParticleEmitter for smoke effect
+        particleEmitter.Color = ColorSequence.new(rayResult.Instance.Color) -- sets particle color to match ground color
+        particleEmitter.Size = NumberSequence.new({ -- defines particle size over lifetime
+            NumberSequenceKeypoint.new(0, 0.5), -- starts at 0.5 studs
+            NumberSequenceKeypoint.new(0.5, 1.5), -- grows to 1.5 studs at midpoint
+            NumberSequenceKeypoint.new(1, 0) -- shrinks to 0 studs at end
+        })
+        particleEmitter.Transparency = NumberSequence.new({ -- defines particle transparency over lifetime
+            NumberSequenceKeypoint.new(0, 0.5), -- starts at 50% transparent
+            NumberSequenceKeypoint.new(1, 1) -- fades to 100% transparent at end
+        })
+        particleEmitter.Lifetime = NumberRange.new(1, 1.5) -- particles exist between 1 and 1.5 seconds
+        particleEmitter.Rate = 0 -- sets continuous emission to 0 (burst only)
+        particleEmitter.Speed = NumberRange.new(5, 10) -- particles move between 5 and 10 studs per second
+        particleEmitter.SpreadAngle = Vector2.new(30, 30) -- particles spread in 30 degree cone on X and Y axes
+        particleEmitter.Parent = smokePart -- parents emitter to smoke part
+
+        particleEmitter:Emit(VFX_CONFIG.ParticleEmitCount) -- emits specified number of particles in burst
+        Debris:AddItem(smokePart, 2) -- schedules smoke part for destruction after 2 seconds
+    end
+end
+
+function VFXManager:createShockwave(rootPart)
+    local ring = Instance.new("Part") -- creates Part for shockwave visual
+    ring.Name = "Shockwave" -- sets name for identification
+    ring.Size = Vector3.new(1, 0.5, 1) -- sets initial size to 1x0.5x1 studs
+    ring.Material = Enum.Material.Neon -- sets material to Neon for glowing effect
+    ring.Color = Color3.fromRGB(255, 255, 255) -- sets color to white
+    ring.Transparency = 0.3 -- sets to 70% opaque (30% transparent)
+    ring.Anchored = true -- anchors in place (no physics)
+    ring.CanCollide = false -- disables collision
+    ring.CFrame = rootPart.CFrame * CFrame.new(0, 0, 1) * CFrame.Angles(math.rad(90), 0, 0) -- positions 1 stud forward and rotates 90 degrees to lay flat
+    ring.Parent = Workspace:FindFirstChild("Debris") or Workspace -- parents to Debris or Workspace
+
+    local mesh = Instance.new("SpecialMesh") -- creates SpecialMesh to change shape
+    mesh.MeshType = Enum.MeshType.FileMesh -- sets mesh type to use custom file mesh
+    mesh.MeshId = "rbxassetid://3270017" -- loads ring mesh from Roblox asset library
+    mesh.Scale = Vector3.new(1, 1, 1) -- sets initial mesh scale to 1x1x1
+    mesh.Parent = ring -- parents mesh to ring part
+
+    createTween(ring, 0.25, { -- creates expansion tween over 0.25 seconds
+        Size = Vector3.new(8, 0.75, 8), -- expands to 8x0.75x8 studs
+        Transparency = 1, -- fades to fully transparent
+        CFrame = ring.CFrame * CFrame.new(0, 0, -1) -- moves 1 stud backward during expansion
+    })
+
+    Debris:AddItem(ring, 0.3) -- schedules ring for destruction after 0.3 seconds
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    DAMAGE INDICATOR SYSTEM
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local DamageIndicator = {} -- creates DamageIndicator class table
+DamageIndicator.__index = DamageIndicator -- sets metatable __index for OOP
+
+function DamageIndicator.show(vroot, damage)
+    local x = math.random(-4, 4) -- generates random X offset between -4 and 4 studs
+
+    local billboardGui = Instance.new("BillboardGui") -- creates BillboardGui for UI in 3D space
+    billboardGui.Size = UDim2.new(4, 0, 2, 0) -- sets size to 4 studs wide and 2 studs tall
+    billboardGui.StudsOffset = Vector3.new(x, 2, 0) -- offsets GUI by random X and 2 studs up
+    billboardGui.AlwaysOnTop = true -- makes GUI render on top of all 3D objects
+    billboardGui.Parent = Workspace:FindFirstChild("Debris") or Workspace -- parents to Debris or Workspace
+
+    local textLabel = Instance.new("TextLabel") -- creates TextLabel for displaying damage number
+    textLabel.Size = UDim2.new(1, 0, 1, 0) -- fills entire BillboardGui
+    textLabel.BackgroundTransparency = 1 -- makes background fully transparent
+    textLabel.Text = "-" .. tostring(damage) -- sets text to negative damage value (e.g., "-15")
+    textLabel.TextColor3 = Color3.fromRGB(0, 0, 0) -- sets initial text color to black
+    textLabel.TextScaled = true -- enables text scaling to fit label size
+    textLabel.Font = Enum.Font.GothamBold -- sets font to GothamBold for bold appearance
+    textLabel.Parent = billboardGui -- parents label to billboard GUI
+
+    local uiStroke = Instance.new("UIStroke") -- creates UIStroke for text outline
+    uiStroke.Thickness = 2 -- sets outline thickness to 2 pixels
+    uiStroke.Color = Color3.fromRGB(255, 255, 255) -- sets outline color to white
+    uiStroke.Parent = textLabel -- parents stroke to text label
+
+    local part = Instance.new("Part") -- creates invisible Part for physics-based movement
+    part.Size = Vector3.new(0.1, 0.1, 0.1) -- sets size to tiny 0.1x0.1x0.1 studs
+    part.Transparency = 1 -- makes part invisible
+    part.CanCollide = false -- disables collision
+    part.Anchored = false -- allows physics to affect part
+    part.CFrame = vroot.CFrame * CFrame.new(x, 0, 0) -- positions at character location with X offset
+    part.Parent = Workspace:FindFirstChild("Debris") or Workspace -- parents to Debris or Workspace
+
+    billboardGui.Adornee = part -- attaches billboard to part so it moves with part
+
+    local bodyVelocity = Instance.new("BodyVelocity") -- creates BodyVelocity for upward motion
+    bodyVelocity.P = 30000 -- sets power to 30000 for strong force
+    bodyVelocity.MaxForce = Vector3.new(0, 40000, 0) -- limits force to Y-axis only with max 40000
+    bodyVelocity.Velocity = Vector3.new(0, 15, 0) -- sets upward velocity to 15 studs per second
+    bodyVelocity.Parent = part -- parents velocity to part
+
+    TweenService:Create(textLabel, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 1), { -- creates color tween (0.16 seconds, Quad easing, repeats once)
+        TextColor3 = Color3.fromRGB(216, 31, 31) -- tweens color from black to red
+    }):Play() -- plays the color tween
+
+    Debris:AddItem(bodyVelocity, 0.08) -- removes velocity after 0.08 seconds to stop upward motion
+    Debris:AddItem(part, 0.5) -- removes part after 0.5 seconds
+    Debris:AddItem(billboardGui, 0.5) -- removes GUI after 0.5 seconds
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    HITBOX DETECTOR CLASS
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local HitboxDetector = {} -- creates HitboxDetector class table
+HitboxDetector.__index = HitboxDetector -- sets metatable __index for OOP
+
+function HitboxDetector.new(character, rootPart)
+    local self = setmetatable({}, HitboxDetector) -- creates new instance with HitboxDetector as metatable
+    self.character = character -- stores reference to character model
+    self.rootPart = rootPart -- stores reference to HumanoidRootPart
+    self.hitTargets = {} -- initializes empty table to track hit enemies
+    self.hitbox = nil -- initializes hitbox as nil (will be created later)
+    self.connection = nil -- initializes connection as nil (will store Heartbeat connection)
+    return self -- returns the new HitboxDetector instance
+end
+
+function HitboxDetector:createHitbox()
+    local hitbox = Instance.new("Part") -- creates Part for hitbox collision detection
+    hitbox.Name = "DashHitbox" -- sets name for identification
+    hitbox.Size = HITBOX_CONFIG.Size -- sets size from config (5.9x6x6.05 studs)
+    hitbox.Transparency = HITBOX_CONFIG.Transparency -- sets transparency from config (1 = invisible)
+    hitbox.CanCollide = false -- disables collision to prevent physics interference
+    hitbox.Anchored = false -- allows hitbox to move with character via weld
+    hitbox.CFrame = self.rootPart.CFrame * HITBOX_CONFIG.Offset -- positions hitbox relative to character using offset
+    hitbox.Material = Enum.Material.ForceField -- sets material to ForceField for visual debugging
+    hitbox.BrickColor = BrickColor.new("Really red") -- sets color to red for debugging
+    hitbox.Parent = Workspace:FindFirstChild("Debris") or Workspace -- parents to Debris or Workspace
+
+    local weld = Instance.new("WeldConstraint") -- creates WeldConstraint to attach hitbox to character
+    weld.Part0 = hitbox -- sets first part of weld to hitbox
+    weld.Part1 = self.rootPart -- sets second part of weld to character's root part
+    weld.Parent = hitbox -- parents weld to hitbox to activate it
+
+    return hitbox -- returns the created hitbox Part
+end
+
+function HitboxDetector:start()
+    self.hitbox = self:createHitbox() -- creates hitbox by calling createHitbox method
+    local overlapParams = createOverlapParams({ -- creates overlap parameters for spatial queries
+        Workspace:FindFirstChild("Map") or Workspace, -- excludes Map from detection
+        self.character, -- excludes own character from detection
+        Workspace:FindFirstChild("Debris") or Workspace -- excludes Debris folder from detection
+    })
+
+    Debris:AddItem(self.hitbox, HITBOX_CONFIG.Lifetime) -- schedules hitbox for destruction after lifetime
+
+    self.connection = RunService.Heartbeat:Connect(function() -- connects to Heartbeat event (runs every frame)
+        if not self.hitbox or not self.hitbox.Parent then -- checks if hitbox still exists and has parent
+            self:stop() -- stops detection if hitbox is destroyed
+            return -- exits function early
+        end
+
+        local partsFound = Workspace:GetPartsInPart(self.hitbox, overlapParams) -- performs spatial query to find parts overlapping hitbox
+
+        for _, part in pairs(partsFound) do -- loops through each detected part
+            local potentialEnemy = part.Parent -- gets parent model (potential enemy character)
+            if potentialEnemy then -- checks if parent exists
+                local enemyHumanoid = potentialEnemy:FindFirstChildWhichIsA("Humanoid") -- finds Humanoid in potential enemy
+
+                if enemyHumanoid -- checks if Humanoid exists
+                    and enemyHumanoid:GetState() ~= Enum.HumanoidStateType.Dead -- checks if enemy is not dead
+                    and not table.find(self.hitTargets, potentialEnemy) -- checks if enemy hasn't been hit yet
+                then
+                    table.insert(self.hitTargets, potentialEnemy) -- adds enemy to hit targets table to prevent duplicate hits
+                    self:onHit(potentialEnemy, enemyHumanoid) -- calls onHit method to handle damage and effects
+                end
+            end
+        end
+    end)
+end
+
+function HitboxDetector:onHit(enemy, enemyHumanoid)
+    local damage = 15 -- sets damage amount to 15 health points
+    enemyHumanoid:TakeDamage(damage) -- applies damage to enemy humanoid
+
+    DamageIndicator.show(enemy.HumanoidRootPart, damage) -- displays floating damage number above enemy
+
+    local knockbackDirection = (enemy.HumanoidRootPart.Position - self.rootPart.Position).Unit -- calculates unit vector from attacker to enemy
+    local bodyVelocity = Instance.new("BodyVelocity") -- creates BodyVelocity for knockback effect
+    bodyVelocity.MaxForce = Vector3.new(20000, 0, 20000) -- limits force to X and Z axes (horizontal only)
+    bodyVelocity.Velocity = knockbackDirection * 50 -- applies velocity in knockback direction at 50 studs per second
+    bodyVelocity.Parent = enemy.HumanoidRootPart -- parents velocity to enemy's root part
+
+    local highlight = Instance.new("Highlight") -- creates Highlight for damage feedback
+    highlight.FillColor = Color3.fromRGB(255, 0, 4) -- sets fill color to red
+    highlight.OutlineColor = Color3.fromRGB(0, 0, 0) -- sets outline color to black
+    highlight.FillTransparency = 0 -- sets fill to fully opaque
+    highlight.OutlineTransparency = 0 -- sets outline to fully opaque
+    highlight.Parent = enemy -- parents highlight to enemy character
+
+    TweenService:Create(highlight, TweenInfo.new(0.5), { -- creates fade-out tween over 0.5 seconds
+        FillTransparency = 1, -- fades fill to fully transparent
+        OutlineTransparency = 1 -- fades outline to fully transparent
+    }):Play() -- plays the fade-out tween
+
+    Debris:AddItem(bodyVelocity, 0.2) -- removes knockback velocity after 0.2 seconds
+    Debris:AddItem(highlight, 0.5) -- removes highlight after 0.5 seconds
+end
+
+function HitboxDetector:stop()
+    if self.connection then -- checks if Heartbeat connection exists
+        self.connection:Disconnect() -- disconnects the Heartbeat connection
+        self.connection = nil -- sets connection to nil for garbage collection
+    end
+
+    if self.hitbox then -- checks if hitbox exists
+        self.hitbox:Destroy() -- destroys the hitbox part
+        self.hitbox = nil -- sets hitbox to nil for garbage collection
+    end
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    DASH STATE CLASS
+    ═══════════════════════════════════════════════════════════════
+]]
+
+local DashState = {} -- creates DashState class table
+DashState.__index = DashState -- sets metatable __index for OOP
+
+function DashState.new(character, config)
+    local self = setmetatable({}, DashState) -- creates new instance with DashState as metatable
+    self.character = character -- stores reference to character model
+    self.humanoid = character:FindFirstChildWhichIsA("Humanoid") -- finds and stores Humanoid instance
+    self.config = config -- stores dash configuration table
+    self.canceled = false -- initializes canceled flag as false
+    self.initialHealth = self.humanoid.Health -- records starting health for damage detection
+    self.startTime = os.clock() -- records start time in seconds for elapsed time calculations
+    self.healthConnection = nil -- initializes health connection as nil
+    return self -- returns the new DashState instance
+end
+
+function DashState:setupCancellation()
+    self.healthConnection = self.humanoid.HealthChanged:Connect(function(newHealth) -- connects to HealthChanged event
+        local elapsed = os.clock() - self.startTime -- calculates elapsed time since dash started
+
+        if self.initialHealth > newHealth and elapsed < self.config.CancelWindow then -- checks if health decreased and within cancel window
+            self:cancel() -- calls cancel method to stop dash
+        end
+    end)
+end
+
+function DashState:cancel()
+    self.canceled = true -- sets canceled flag to true
+    self:cleanup() -- calls cleanup to disconnect health connection
+end
+
+function DashState:isHealthBroken()
+    return self.humanoid.Health < self.initialHealth -- returns true if current health is less than initial health
+end
+
+function DashState:cleanup()
+    if self.healthConnection then -- checks if health connection exists
+        self.healthConnection:Disconnect() -- disconnects HealthChanged connection
+        self.healthConnection = nil -- sets connection to nil for garbage collection
+    end
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    MAIN DASH CONTROLLER
+    ═══════════════════════════════════════════════════════════════
+]]
+
+function DashSystem.new()
+    local self = setmetatable({}, DashSystem) -- creates new instance with DashSystem as metatable
+    self.vfxManager = VFXManager.new() -- creates new VFXManager instance for handling visual effects
+    return self -- returns the new DashSystem instance
+end
+
+function DashSystem:executeFrontDash(character, animation)
+    local rootPart = character.HumanoidRootPart -- gets reference to character's HumanoidRootPart
+    local config = DASH_CONFIG.Front -- retrieves front dash configuration from config table
+    local state = DashState.new(character, config) -- creates new DashState to manage dash lifecycle
+
+    animation:AdjustSpeed(1) -- sets animation playback speed to normal (1x speed)
+
+    local hitboxDetector = HitboxDetector.new(character, rootPart) -- creates hitbox detector for collision detection
+    hitboxDetector:start() -- starts hitbox detection loop
+
+    local bodyVelocity = Instance.new("BodyVelocity") -- creates BodyVelocity for physics-based movement
+    bodyVelocity.MaxForce = Vector3.new(30000, 0, 30000) -- sets maximum force on X and Z axes (horizontal movement only)
+    bodyVelocity.Parent = rootPart -- parents velocity to root part to apply force
+
+    state:setupCancellation() -- sets up health-based cancellation monitoring
+    self:startVFXLoop(character, rootPart, state, config.Duration) -- starts visual effects loop
+
+    self.vfxManager:createShockwave(rootPart) -- creates expanding shockwave effect at dash start
+
+    local rightArm = character:FindFirstChild("Right Arm") or character:FindFirstChild("RightHand") -- finds right arm (R6) or right hand (R15)
+    if rightArm then -- checks if right arm/hand exists
+        LimbTrailSystem.createTrail(rightArm, VFX_CONFIG.TrailDuration) -- creates trail effect on right arm
+    end
+
+    local velocity = config.InitialVelocity -- initializes velocity variable with starting speed (120 studs/second)
+    bodyVelocity.Velocity = rootPart.CFrame.LookVector * velocity -- sets velocity in forward direction using LookVector
+
+    repeat -- starts velocity decay loop
+        if state.canceled then -- checks if dash was canceled
+            velocity = 0 -- sets velocity to 0 to exit loop
+            break -- exits loop immediately
+        end
+
+        if velocity < config.MinVelocity then -- checks if velocity is below minimum threshold (7 studs/second)
+            velocity = velocity - 1 -- applies slower deceleration (1 stud/second)
+        else -- velocity is above minimum threshold
+            velocity = velocity - config.Deceleration -- applies normal deceleration (7 studs/second)
+        end
+
+        task.wait(0.025) -- waits 25 milliseconds (0.025 seconds) before next iteration
+        bodyVelocity.Velocity = rootPart.CFrame.LookVector * velocity -- updates velocity with new reduced value
+    until velocity <= 0 or state:isHealthBroken() -- continues until velocity reaches 0 or health is broken
+
+    bodyVelocity:Destroy() -- destroys BodyVelocity to stop applying force
+    animation:Stop() -- stops the dash animation
+    state:cleanup() -- cleans up health connections
+end
+
+function DashSystem:executeBackwardDash(character, animation)
+    local rootPart = character.HumanoidRootPart -- gets reference to character's HumanoidRootPart
+    local config = DASH_CONFIG.Backward -- retrieves backward dash configuration from config table
+    local state = DashState.new(character, config) -- creates new DashState to manage dash lifecycle
+
+    animation:AdjustSpeed(1.2) -- sets animation playback speed to 1.2x for faster backward movement
+
+    local rightArm = character:FindFirstChild("Right Arm") or character:FindFirstChild("RightHand") -- finds right arm (R6) or right hand (R15)
+    local leftArm = character:FindFirstChild("Left Arm") or character:FindFirstChild("LeftHand") -- finds left arm (R6) or left hand (R15)
+
+    if rightArm then -- checks if right arm/hand exists
+        LimbTrailSystem.createTrail(rightArm, 0.5) -- creates trail effect on right arm for 0.5 seconds
+    end
+    if leftArm then -- checks if left arm/hand exists
+        LimbTrailSystem.createTrail(leftArm, 0.5) -- creates trail effect on left arm for 0.5 seconds
+    end
+
+    local bodyVelocity = Instance.new("BodyVelocity") -- creates BodyVelocity for physics-based movement
+    bodyVelocity.MaxForce = Vector3.new(30000, 0, 30000) -- sets maximum force on X and Z axes (horizontal movement only)
+    bodyVelocity.Parent = rootPart -- parents velocity to root part to apply force
+
+    state:setupCancellation() -- sets up health-based cancellation monitoring
+    self:startVFXLoop(character, rootPart, state, config.Duration) -- starts visual effects loop
+
+    local velocity = config.InitialVelocity -- initializes velocity variable with starting speed (100 studs/second)
+    bodyVelocity.Velocity = rootPart.CFrame.LookVector * -velocity -- sets velocity in backward direction (negative LookVector)
+
+    local phaseChanged = false -- initializes phase change flag as false
+    animation:GetMarkerReachedSignal("dashAgain"):Connect(function() -- connects to "dashAgain" animation marker
+        if not phaseChanged then -- checks if phase hasn't changed yet
+            velocity = config.SecondPhaseVelocity -- changes velocity to second phase value (80 studs/second)
+            phaseChanged = true -- sets phase change flag to true to prevent multiple triggers
+        end
+    end)
+
+    repeat -- starts velocity decay loop
+        if state.canceled then -- checks if dash was canceled
+            velocity = 0 -- sets velocity to 0 to exit loop
+            break -- exits loop immediately
+        end
+
+        task.wait(0.025) -- waits 25 milliseconds (0.025 seconds) before next iteration
+        velocity = velocity - config.Deceleration -- reduces velocity by deceleration rate (7.5 studs/second)
+        bodyVelocity.Velocity = rootPart.CFrame.LookVector * -velocity -- updates velocity in backward direction
+    until velocity <= 0 or state:isHealthBroken() -- continues until velocity reaches 0 or health is broken
+
+    bodyVelocity:Destroy() -- destroys BodyVelocity to stop applying force
+    animation:Stop() -- stops the dash animation
+    state:cleanup() -- cleans up health connections
+end
+
+function DashSystem:executeSideDash(character, direction, animation)
+    local rootPart = character.HumanoidRootPart -- gets reference to character's HumanoidRootPart
+    local humanoid = character:FindFirstChildWhichIsA("Humanoid") -- finds Humanoid instance
+    local config = DASH_CONFIG.Side -- retrieves side dash configuration from config table
+    local state = DashState.new(character, config) -- creates new DashState to manage dash lifecycle
+
+    local rightArm = character:FindFirstChild("Right Arm") or character:FindFirstChild("RightHand") -- finds right arm (R6) or right hand (R15)
+    local leftArm = character:FindFirstChild("Left Arm") or character:FindFirstChild("LeftHand") -- finds left arm (R6) or left hand (R15)
+
+    if rightArm then -- checks if right arm/hand exists
+        LimbTrailSystem.createTrail(rightArm, 0.5) -- creates trail effect on right arm for 0.5 seconds
+    end
+    if leftArm then -- checks if left arm/hand exists
+        LimbTrailSystem.createTrail(leftArm, 0.5) -- creates trail effect on left arm for 0.5 seconds
+    end
+
+    local bodyVelocity = Instance.new("BodyVelocity") -- creates BodyVelocity for physics-based movement
+    bodyVelocity.MaxForce = Vector3.new(30000, 0, 30000) -- sets maximum force on X and Z axes (horizontal movement only)
+    bodyVelocity.Parent = rootPart -- parents velocity to root part to apply force
+
+    state:setupCancellation() -- sets up health-based cancellation monitoring
+    self:startVFXLoop(character, rootPart, state, config.Duration) -- starts visual effects loop
+
+    local autoRotateRestore = animation.Stopped:Connect(function() -- connects to animation Stopped event
+        humanoid.AutoRotate = true -- re-enables automatic character rotation toward movement direction
+    end)
+
+    local velocity = config.InitialVelocity -- initializes velocity variable with starting speed (100 studs/second)
+    local dirMultiplier = (direction == "Left") and -1 or 1 -- sets multiplier to -1 for left dash or 1 for right dash
+    bodyVelocity.Velocity = rootPart.CFrame.RightVector * (velocity * dirMultiplier) -- sets velocity perpendicular to facing direction
+
+    repeat -- starts velocity decay loop
+        if state.canceled then -- checks if dash was canceled
+            velocity = 0 -- sets velocity to 0 to exit loop
+            break -- exits loop immediately
+        end
+
+        task.wait(0.025) -- waits 25 milliseconds (0.025 seconds) before next iteration
+        velocity = velocity - config.Deceleration -- reduces velocity by deceleration rate (7.5 studs/second)
+        bodyVelocity.Velocity = rootPart.CFrame.RightVector * (velocity * dirMultiplier) -- updates velocity with direction multiplier
+    until velocity <= 0 or state:isHealthBroken() -- continues until velocity reaches 0 or health is broken
+
+    bodyVelocity:Destroy() -- destroys BodyVelocity to stop applying force
+    animation:Stop() -- stops the dash animation
+    state:cleanup() -- cleans up health connections
+    autoRotateRestore:Disconnect() -- disconnects auto-rotate restoration connection
+end
+
+function DashSystem:startVFXLoop(character, rootPart, state, duration)
+    task.spawn(function() -- spawns new thread to run VFX loop concurrently with physics
+        self.vfxManager:createHighlight(character, VFX_CONFIG.HighlightDuration) -- creates character highlight effect
+
+        local startTime = os.clock() -- records start time in seconds for duration tracking
+
+        repeat -- starts VFX generation loop
+            task.wait(VFX_CONFIG.SmokePollRate) -- waits 0.075 seconds between effect spawns
+
+            if state.canceled then break end -- exits loop if dash was canceled
+
+            self.vfxManager:createGroundSmoke(rootPart) -- creates ground smoke particles
+
+            RockDebrisSystem.SideRock2( -- spawns rock debris on sides
+                rootPart.CFrame, -- origin position (character's current CFrame)
+                rootPart.CFrame.UpVector * -5, -- direction vector (5 studs downward)
+                2, -- spread distance in studs from center
+                0.75, -- size of rock debris in studs
+                1.5 -- lifetime of rocks in seconds
+            )
+        until (os.clock() - startTime) > duration or state:isHealthBroken() -- continues until duration expires or health is broken
+    end)
+end
+
+--[[
+    ═══════════════════════════════════════════════════════════════
+    PUBLIC API
+    ═══════════════════════════════════════════════════════════════
+]]
+
+function DashSystem.Dash(data)
+    local controller = DashSystem.new() -- creates new DashSystem controller instance
+    local character = data.Char -- extracts character model from data table
+    local direction = data.Dir -- extracts direction string from data table
+    local animation = data.Anim -- extracts animation track from data table
+
+    if direction == "Front" then -- checks if direction is forward
+        controller:executeFrontDash(character, animation) -- executes front dash
+    elseif direction == "Backward" then -- checks if direction is backward
+        controller:executeBackwardDash(character, animation) -- executes backward dash
+    end
+end
+
+function DashSystem.sideDash(data)
+    local controller = DashSystem.new() -- creates new DashSystem controller instance
+    controller:executeSideDash(data.Char, data.Dir, data.Anim) -- executes side dash with character, direction, and animation
+end
+
+return DashSystem -- returns the DashSystem module table for requiring
