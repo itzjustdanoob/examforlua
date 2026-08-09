@@ -1,0 +1,1239 @@
+--!strict
+
+--[[
+	CombatController
+	============================================================
+
+	This module owns the authoritative combat state for one character.
+
+	The important design decision here is that combat state is stored
+	inside the controller instead of being reconstructed from temporary
+	instances or animation state. This gives the server one source of
+	truth
+	for whether a character is attacking, blocking, stunned, or available
+	to begin another action.
+
+	The module deliberately separates the combat pipeline into stages:
+
+		1. Validate the requested action.
+		2. Advance combo state.
+		3. Wait for the attack windup.
+		4. Perform spatial hit detection.
+		5. Resolve blocking / guard breaking.
+		6. Apply damage, stun and movement.
+		7. Enter recovery.
+		8. Release the attack state.
+
+	Keeping those stages independent means individual mechanics can be
+	changed without rewriting the entire attack lifecycle.
+
+	The client should only request an action. The server-side controller
+	decides whether that action is legal and what actually happens.
+]]
+
+local CombatController = {}
+CombatController.__index = CombatController
+
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+--============================================================
+-- TYPES
+--============================================================
+
+export type AttackDefinition = {
+	Damage: number,
+	Stun: number,
+
+	Windup: number,
+	ActiveTime: number,
+	Recovery: number,
+
+	HitboxSize: Vector3,
+	HitboxOffset: CFrame,
+
+	Knockback: Vector3,
+
+	GuardBreak: boolean?,
+	CanHitRagdolled: boolean?,
+}
+
+export type CombatConfig = {
+	ComboResetTime: number?,
+	MaxCombo: number?,
+
+	DefaultWalkSpeed: number?,
+	BlockedWalkSpeed: number?,
+
+	DebugHitboxes: boolean?,
+}
+
+export type CombatState = {
+	Combo: number,
+	LastAttackTime: number,
+
+	Attacking: boolean,
+	Blocking: boolean,
+
+	StunnedUntil: number,
+
+	AttackId: number,
+}
+
+--============================================================
+-- DEFAULT CONFIG
+--============================================================
+
+local DEFAULT_CONFIG: CombatConfig = {
+	ComboResetTime = 1.25,
+	MaxCombo = 4,
+
+	DefaultWalkSpeed = 16,
+	BlockedWalkSpeed = 6,
+
+	DebugHitboxes = false,
+}
+
+--============================================================
+-- DEFAULT ATTACKS
+--============================================================
+
+local DEFAULT_ATTACKS: {[number]: AttackDefinition} = {
+
+	[1] = {
+		Damage = 4,
+		Stun = 0.25,
+
+		Windup = 0.08,
+		ActiveTime = 0.10,
+		Recovery = 0.22,
+
+		HitboxSize = Vector3.new(5, 5, 4.5),
+		HitboxOffset = CFrame.new(0, 0, -3),
+
+		Knockback = Vector3.new(0, 4, 18),
+	},
+
+	[2] = {
+		Damage = 4,
+		Stun = 0.28,
+
+		Windup = 0.08,
+		ActiveTime = 0.10,
+		Recovery = 0.22,
+
+		HitboxSize = Vector3.new(5.2, 5, 4.8),
+		HitboxOffset = CFrame.new(0, 0, -3),
+
+		Knockback = Vector3.new(0, 5, 20),
+	},
+
+	[3] = {
+		Damage = 5,
+		Stun = 0.35,
+
+		Windup = 0.09,
+		ActiveTime = 0.11,
+		Recovery = 0.25,
+
+		HitboxSize = Vector3.new(5.5, 5.2, 5),
+		HitboxOffset = CFrame.new(0, 0, -3.2),
+
+		Knockback = Vector3.new(0, 7, 24),
+	},
+
+	[4] = {
+		Damage = 8,
+		Stun = 0.7,
+
+		Windup = 0.10,
+		ActiveTime = 0.14,
+		Recovery = 0.45,
+
+		HitboxSize = Vector3.new(6, 5.5, 5.5),
+		HitboxOffset = CFrame.new(0, 0, -3.5),
+
+		Knockback = Vector3.new(0, 12, 45),
+
+		GuardBreak = true,
+	},
+}
+
+--============================================================
+-- PRIVATE HELPERS
+--============================================================
+
+local function getHumanoid(character: Model): Humanoid?
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot(character: Model): BasePart?
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if root and root:IsA("BasePart") then
+		return root
+	end
+
+	return nil
+end
+
+local function isAlive(character: Model): boolean
+	local humanoid = getHumanoid(character)
+
+	return humanoid ~= nil and humanoid.Health > 0
+end
+
+local function clock(): number
+	return os.clock()
+end
+
+--============================================================
+-- CONSTRUCTOR
+--============================================================
+
+function CombatController.new(
+	character: Model,
+	config: CombatConfig?
+)
+
+	assert(
+		character:IsA("Model"),
+		"CombatController requires a Model"
+	)
+
+	local humanoid = getHumanoid(character)
+	local root = getRoot(character)
+
+	assert(
+		humanoid,
+		"CombatController requires a Humanoid"
+	)
+
+	assert(
+		root,
+		"CombatController requires a HumanoidRootPart"
+	)
+
+	-- Clone the defaults rather than mutating the shared table.
+	-- Controllers may receive different tuning values, so sharing the
+	-- same configuration table would allow one character's settings to
+	-- accidentally affect every other controller.
+	local finalConfig: CombatConfig =
+		table.clone(DEFAULT_CONFIG)
+
+	if config then
+		for key, value in pairs(config) do
+			(finalConfig :: any)[key] = value
+		end
+	end
+
+	local self = setmetatable({
+
+		Character = character,
+		Humanoid = humanoid,
+		RootPart = root,
+
+		Config = finalConfig,
+
+		-- The attack table is copied per controller so custom attacks can
+		-- be registered for one character without changing the global
+		-- defaults used by another controller.
+		Attacks = table.clone(DEFAULT_ATTACKS),
+
+		State = {
+			Combo = 0,
+			LastAttackTime = 0,
+
+			Attacking = false,
+			Blocking = false,
+
+			StunnedUntil = 0,
+
+			AttackId = 0,
+		} :: CombatState,
+
+		Connections = {},
+
+		Destroyed = false,
+
+	}, CombatController)
+
+	self:_bindCharacter()
+
+	return self
+end
+
+--============================================================
+-- CHARACTER LIFECYCLE
+--============================================================
+
+function CombatController:_bindCharacter()
+
+	local connection = self.Humanoid.Died:Connect(function()
+
+		-- An attack may still be inside a delayed windup/recovery stage
+		-- when the humanoid dies. Cancelling it invalidates that pending
+		-- operation instead of allowing it to resolve after death.
+		self:CancelAttack()
+
+		self.State.Blocking = false
+
+		self:_syncAttributes()
+	end)
+
+	table.insert(
+		self.Connections,
+		connection
+	)
+end
+
+--============================================================
+-- STATE QUERIES
+--============================================================
+
+function CombatController:IsStunned(): boolean
+	return clock() < self.State.StunnedUntil
+end
+
+function CombatController:IsAttacking(): boolean
+	return self.State.Attacking
+end
+
+function CombatController:IsBlocking(): boolean
+	return self.State.Blocking
+end
+
+--============================================================
+-- ATTRIBUTE SYNCHRONIZATION
+--============================================================
+
+function CombatController:_syncAttributes()
+
+	if self.Destroyed then
+		return
+	end
+
+	-- Attributes are only a replicated representation of the controller
+	-- state. The controller itself remains authoritative, preventing
+	-- gameplay logic from depending on values that other systems may
+	-- modify accidentally.
+	self.Character:SetAttribute(
+		"Attacking",
+		self.State.Attacking
+	)
+
+	self.Character:SetAttribute(
+		"Blocking",
+		self.State.Blocking
+	)
+
+	self.Character:SetAttribute(
+		"Stunned",
+		self:IsStunned()
+	)
+
+	self.Character:SetAttribute(
+		"Combo",
+		self.State.Combo
+	)
+end
+
+--============================================================
+-- STUN
+--============================================================
+
+function CombatController:ApplyStun(duration: number)
+
+	if self.Destroyed then
+		return
+	end
+
+	duration = math.max(duration, 0)
+
+	-- Stuns extend from the latest expiry instead of replacing an
+	-- existing longer stun with a shorter one. This prevents multiple
+	-- combat systems from accidentally shortening each other's crowd
+	-- control duration.
+	self.State.StunnedUntil = math.max(
+		self.State.StunnedUntil,
+		clock() + duration
+	)
+
+	self.State.Attacking = false
+
+	self.Humanoid.WalkSpeed = 0
+	self.Humanoid.JumpPower = 0
+	self.Humanoid.AutoRotate = false
+
+	self:_syncAttributes()
+
+	task.delay(duration, function()
+
+		if self.Destroyed then
+			return
+		end
+
+		-- A newer stun may have extended the expiry while this delayed
+		-- callback was waiting. Only restore movement when this callback
+		-- is actually responsible for the final stun ending.
+		if not self:IsStunned() then
+
+			self.Humanoid.WalkSpeed =
+				self.Config.DefaultWalkSpeed :: number
+
+			self.Humanoid.JumpPower = 50
+			self.Humanoid.AutoRotate = true
+
+			self:_syncAttributes()
+		end
+	end)
+end
+
+--============================================================
+-- BLOCKING
+--============================================================
+
+function CombatController:SetBlocking(
+	enabled: boolean
+): boolean
+
+	if self.Destroyed then
+		return false
+	end
+
+	if not isAlive(self.Character) then
+		return false
+	end
+
+	if enabled then
+
+		-- Blocking and attacking are mutually exclusive states. Rejecting
+		-- the transition here keeps higher-level input code simple because
+		-- every caller receives the same authoritative state decision.
+		if self:IsStunned()
+			or self.State.Attacking
+		then
+			return false
+		end
+
+		self.State.Blocking = true
+
+		self.Humanoid.WalkSpeed =
+			self.Config.BlockedWalkSpeed :: number
+
+	else
+
+		self.State.Blocking = false
+
+		if not self:IsStunned() then
+
+			self.Humanoid.WalkSpeed =
+				self.Config.DefaultWalkSpeed :: number
+		end
+	end
+
+	self:_syncAttributes()
+
+	return true
+end
+
+--============================================================
+-- DIRECTIONAL BLOCKING
+--============================================================
+
+function CombatController:IsTargetFacingAttacker(
+	target: Model
+): boolean
+
+	local targetRoot = getRoot(target)
+
+	if not targetRoot then
+		return false
+	end
+
+	local direction =
+		self.RootPart.Position
+		- targetRoot.Position
+
+	-- Avoid normalizing an almost-zero vector. Two characters occupying
+	-- practically the same position have no meaningful facing direction,
+	-- so treating the attack as frontal is safer than generating NaNs.
+	if direction.Magnitude <= 0.001 then
+		return true
+	end
+
+	direction = direction.Unit
+
+	-- The dot product measures how closely the target's forward vector
+	-- points toward the attacker. A positive result means the attacker is
+	-- within the target's forward hemisphere, allowing blocking to depend
+	-- on direction rather than simply checking a boolean attribute.
+	local facing =
+		targetRoot.CFrame.LookVector:Dot(direction)
+
+	return facing > 0.15
+end
+
+--============================================================
+-- GUARD BREAK
+--============================================================
+
+function CombatController:GuardBreak(
+	target: Model,
+	duration: number
+)
+
+	local humanoid = getHumanoid(target)
+
+	if not humanoid then
+		return
+	end
+
+	target:SetAttribute(
+		"Blocking",
+		false
+	)
+
+	target:SetAttribute(
+		"Guardbroken",
+		true
+	)
+
+	-- Guard break is represented separately from normal stun so other
+	-- combat systems can distinguish "temporarily unable to block" from
+	-- ordinary hitstun without having to infer it from movement values.
+	target:SetAttribute(
+		"Stunned",
+		true
+	)
+
+	humanoid.WalkSpeed = 0
+	humanoid.JumpPower = 0
+	humanoid.AutoRotate = false
+
+	task.delay(duration, function()
+
+		if not target.Parent then
+			return
+		end
+
+		if humanoid.Health <= 0 then
+			return
+		end
+
+		target:SetAttribute(
+			"Guardbroken",
+			false
+		)
+
+		target:SetAttribute(
+			"Stunned",
+			false
+		)
+
+		humanoid.WalkSpeed = 16
+		humanoid.JumpPower = 50
+		humanoid.AutoRotate = true
+	end)
+end
+
+--============================================================
+-- KNOCKBACK
+--============================================================
+
+function CombatController:ApplyKnockback(
+	target: Model,
+	velocity: Vector3,
+	duration: number?
+)
+
+	local root = getRoot(target)
+
+	if not root then
+		return
+	end
+
+	duration = duration or 0.18
+
+	local attachment =
+		Instance.new("Attachment")
+
+	attachment.Name = "CombatVelocity"
+
+	attachment.Parent = root
+
+	local velocityConstraint =
+		Instance.new("LinearVelocity")
+
+	velocityConstraint.Attachment0 =
+		attachment
+
+	-- The attack definition supplies an explicit world-space velocity.
+	-- Using LinearVelocity keeps the movement constraint temporary and
+	-- deterministic without relying on deprecated BodyMover objects.
+	velocityConstraint.RelativeTo =
+		Enum.ActuatorRelativeTo.World
+
+	velocityConstraint.VelocityConstraintMode =
+		Enum.VelocityConstraintMode.Vector
+
+	velocityConstraint.VectorVelocity =
+		velocity
+
+	velocityConstraint.ForceLimitsEnabled = false
+
+	velocityConstraint.Parent =
+		attachment
+
+	Debris:AddItem(
+		attachment,
+		duration
+	)
+end
+
+--============================================================
+-- DEBUG HITBOX
+--============================================================
+
+function CombatController:_debugHitbox(
+	cframe: CFrame,
+	size: Vector3,
+	duration: number
+)
+
+	if not self.Config.DebugHitboxes then
+		return
+	end
+
+	local debugPart =
+		Instance.new("Part")
+
+	debugPart.Name =
+		"CombatDebugHitbox"
+
+	debugPart.Size =
+		size
+
+	debugPart.CFrame =
+		cframe
+
+	debugPart.Anchored = true
+	debugPart.CanCollide = false
+	debugPart.CanTouch = false
+	debugPart.CanQuery = false
+
+	debugPart.Material =
+		Enum.Material.ForceField
+
+	debugPart.Color =
+		Color3.fromRGB(255, 60, 60)
+
+	debugPart.Transparency = 0.65
+
+	debugPart.Parent =
+		workspace
+
+	Debris:AddItem(
+		debugPart,
+		duration
+	)
+end
+
+--============================================================
+-- HITBOX QUERY
+--============================================================
+
+function CombatController:_getTargets(
+	attack: AttackDefinition
+): {Model}
+
+	local root = self.RootPart
+
+	-- The hitbox is calculated from the attacker's current transform
+	-- instead of storing a physical hitbox part. This makes the query
+	-- independent from physics simulation and allows the server to test
+	-- the exact attack volume for the current frame.
+	local hitboxCFrame =
+		root.CFrame
+		* attack.HitboxOffset
+
+	self:_debugHitbox(
+		hitboxCFrame,
+		attack.HitboxSize,
+		attack.ActiveTime
+	)
+
+	local overlapParams =
+		OverlapParams.new()
+
+	-- Excluding the attacker at the spatial-query level is cheaper and
+	-- less error-prone than querying every nearby part and then repeatedly
+	-- asking whether that part belongs to the attacker.
+	overlapParams.ExcludeInstances = {
+		self.Character,
+	}
+
+	local debrisFolder =
+		workspace:FindFirstChild("Debris")
+
+	if debrisFolder then
+		-- Debris is excluded because visual effects and temporary combat
+		-- objects can contain BaseParts. Allowing them into the query would
+		-- create unnecessary candidate results before character filtering.
+		overlapParams:AddToFilter(
+			debrisFolder
+		)
+	end
+
+	-- Bounding-box queries are appropriate here because the attack is
+	-- represented as a rectangular combat volume. No physical hitbox
+	-- instance needs to be created, welded, simulated, or cleaned up.
+	local parts =
+		workspace:GetPartBoundsInBox(
+			hitboxCFrame,
+			attack.HitboxSize,
+			overlapParams
+		)
+
+	local targets: {Model} = {}
+
+	-- A character contains multiple BaseParts, so the same target can
+	-- appear many times in the spatial-query result. This registry
+	-- converts those part-level results into one character-level result.
+	local registered: {[Model]: boolean} = {}
+
+	for _, part in ipairs(parts) do
+
+		local model =
+			part:FindFirstAncestorOfClass("Model")
+
+		if not model
+			or registered[model]
+		then
+			continue
+		end
+
+		if not isAlive(model) then
+			continue
+		end
+
+		local humanoid =
+			getHumanoid(model)
+
+		if not humanoid
+			or humanoid == self.Humanoid
+		then
+			continue
+		end
+
+		registered[model] = true
+
+		table.insert(
+			targets,
+			model
+		)
+	end
+
+	return targets
+end
+
+--============================================================
+-- HIT RESOLUTION
+--============================================================
+
+function CombatController:ResolveHit(
+	target: Model,
+	attack: AttackDefinition
+): boolean
+
+	if not isAlive(target) then
+		return false
+	end
+
+	local humanoid =
+		getHumanoid(target)
+
+	local root =
+		getRoot(target)
+
+	if not humanoid or not root then
+		return false
+	end
+
+	-- Ragdolled targets are normally excluded because applying normal
+	-- hitstun and movement control to a physics-driven character can
+	-- fight against the ragdoll system. Specific attacks can opt into
+	-- ragdolled targets when that interaction is intentional.
+	if target:GetAttribute("Ragdolled")
+		and not attack.CanHitRagdolled
+	then
+		return false
+	end
+
+	local blocking =
+		target:GetAttribute("Blocking") == true
+
+	if blocking then
+
+		if self:IsTargetFacingAttacker(target) then
+
+			if attack.GuardBreak then
+
+				self:GuardBreak(
+					target,
+					attack.Stun
+				)
+
+			else
+
+				-- A frontal block consumes the hit without damaging the
+				-- target. Keeping this decision here means every attack
+				-- automatically follows the same blocking rules.
+				return false
+			end
+
+		else
+
+			-- Blocking only protects the character's forward hemisphere.
+			-- Turning the attacker's direction into the target's local
+			-- facing calculation makes back attacks naturally bypass block.
+			target:SetAttribute(
+				"Blocking",
+				false
+			)
+		end
+	end
+
+	humanoid:TakeDamage(
+		attack.Damage
+	)
+
+	target:SetAttribute(
+		"Stunned",
+		true
+	)
+
+	task.delay(
+		attack.Stun,
+		function()
+
+			if not target.Parent then
+				return
+			end
+
+			if humanoid.Health <= 0 then
+				return
+			end
+
+			-- Guard break owns the stun state while it is active. A normal
+			-- hit callback must therefore not prematurely clear a stronger
+			-- guard-break state.
+			if not target:GetAttribute("Guardbroken") then
+
+				target:SetAttribute(
+					"Stunned",
+					false
+				)
+			end
+		end
+	)
+
+	-- Attack knockback is defined in the attacker's local coordinate
+	-- system. Converting forward/right components through the attacker's
+	-- CFrame allows the same attack to launch targets correctly regardless
+	-- of which world direction the attacker is facing.
+	local forward =
+		self.RootPart.CFrame.LookVector
+
+	local right =
+		self.RootPart.CFrame.RightVector
+
+	local localKnockback =
+		attack.Knockback
+
+	local worldVelocity =
+		forward * localKnockback.Z
+
+	worldVelocity +=
+		right * localKnockback.X
+
+	worldVelocity +=
+		Vector3.new(
+			0,
+			localKnockback.Y,
+			0
+		)
+
+	self:ApplyKnockback(
+		target,
+		worldVelocity
+	)
+
+	return true
+end
+
+--============================================================
+-- ATTACK VALIDATION
+--============================================================
+
+function CombatController:CanAttack(): boolean
+
+	if self.Destroyed then
+		return false
+	end
+
+	if not isAlive(self.Character) then
+		return false
+	end
+
+	if self:IsStunned() then
+		return false
+	end
+
+	if self.State.Blocking then
+		return false
+	end
+
+	-- Preventing overlapping attacks here makes the controller a
+	-- serialized state machine. Without this gate, two requests arriving
+	-- close together could each create their own active hit window.
+	if self.State.Attacking then
+		return false
+	end
+
+	return true
+end
+
+--============================================================
+-- COMBO MANAGEMENT
+--============================================================
+
+function CombatController:_advanceCombo(): number
+
+	local currentTime =
+		clock()
+
+	local resetTime =
+		self.Config.ComboResetTime :: number
+
+	local maxCombo =
+		self.Config.MaxCombo :: number
+
+	-- Combo progression depends on elapsed time rather than frame count.
+	-- This keeps the combo window consistent even if the server's frame
+	-- rate changes.
+	if currentTime - self.State.LastAttackTime
+		> resetTime
+	then
+
+		self.State.Combo = 0
+	end
+
+	self.State.Combo += 1
+
+	if self.State.Combo > maxCombo then
+		self.State.Combo = 1
+	end
+
+	self.State.LastAttackTime =
+		currentTime
+
+	self:_syncAttributes()
+
+	return self.State.Combo
+end
+
+--============================================================
+-- START ATTACK
+--============================================================
+
+function CombatController:StartAttack(
+	attackIndex: number
+): (boolean, number?)
+
+	if not self:CanAttack() then
+		return false, nil
+	end
+
+	local attack =
+		self.Attacks[attackIndex]
+
+	if not attack then
+		return false, nil
+	end
+
+	local combo =
+		self:_advanceCombo()
+
+	self.State.Attacking = true
+
+	-- Every attack receives a unique ID. Delayed attack stages compare
+	-- their captured ID against the current state, allowing cancellation
+	-- without having to kill unrelated coroutines.
+	self.State.AttackId += 1
+
+	local attackId =
+		self.State.AttackId
+
+	self:_syncAttributes()
+
+	-- Windup represents the portion of the animation where the attack
+	-- has started but has not reached its impact frame. Keeping hit
+	-- detection out of this period prevents damage from occurring before
+	-- the intended contact point.
+	task.wait(
+		attack.Windup
+	)
+
+	if self.Destroyed
+		or attackId ~= self.State.AttackId
+	then
+
+		self.State.Attacking = false
+
+		self:_syncAttributes()
+
+		return false, combo
+	end
+
+	if not isAlive(self.Character) then
+
+		self.State.Attacking = false
+
+		self:_syncAttributes()
+
+		return false, combo
+	end
+
+	local hitTargets: {[Model]: boolean} = {}
+
+	local activeStart =
+		clock()
+
+	while clock() - activeStart
+		< attack.ActiveTime
+	do
+
+		if self.Destroyed
+			or attackId ~= self.State.AttackId
+		then
+			break
+		end
+
+		local targets =
+			self:_getTargets(attack)
+
+		for _, target in ipairs(targets) do
+
+			if not hitTargets[target] then
+
+				-- The registry exists for the entire active window rather
+				-- than one query. This prevents a target standing inside
+				-- the hitbox from taking damage every Heartbeat.
+				hitTargets[target] = true
+
+				self:ResolveHit(
+					target,
+					attack
+				)
+			end
+		end
+
+		RunService.Heartbeat:Wait()
+	end
+
+	-- Recovery is part of the authoritative attack lifecycle. The client
+	-- may visually finish an animation sooner, but the server keeps the
+	-- state locked until the configured recovery period has completed.
+	if not self.Destroyed
+		and attackId == self.State.AttackId
+	then
+
+		task.wait(
+			attack.Recovery
+		)
+	end
+
+	if attackId == self.State.AttackId then
+
+		self.State.Attacking = false
+
+		self:_syncAttributes()
+	end
+
+	return true, combo
+end
+
+--============================================================
+-- CANCEL ATTACK
+--============================================================
+
+function CombatController:CancelAttack()
+
+	-- Incrementing the ID invalidates all delayed portions of the current
+	-- attack. This is safer than trying to track and manually destroy
+	-- every coroutine created by the attack lifecycle.
+	self.State.AttackId += 1
+
+	self.State.Attacking = false
+
+	self:_syncAttributes()
+end
+
+--============================================================
+-- COMBO RESET
+--============================================================
+
+function CombatController:ResetCombo()
+
+	self.State.Combo = 0
+	self.State.LastAttackTime = 0
+
+	self:_syncAttributes()
+end
+
+--============================================================
+-- CUSTOM ATTACK REGISTRATION
+--============================================================
+
+function CombatController:RegisterAttack(
+	index: number,
+	attack: AttackDefinition
+)
+
+	assert(
+		typeof(index) == "number",
+		"Attack index must be a number"
+	)
+
+	assert(
+		typeof(attack) == "table",
+		"Attack definition must be a table"
+	)
+
+	assert(
+		attack.Damage >= 0,
+		"Damage cannot be negative"
+	)
+
+	assert(
+		attack.Stun >= 0,
+		"Stun cannot be negative"
+	)
+
+	assert(
+		attack.Windup >= 0
+		and attack.ActiveTime >= 0
+		and attack.Recovery >= 0,
+		"Attack timings cannot be negative"
+	)
+
+	assert(
+		attack.HitboxSize.X > 0
+		and attack.HitboxSize.Y > 0
+		and attack.HitboxSize.Z > 0,
+		"Hitbox dimensions must be greater than zero"
+	)
+
+	-- Registration happens per controller so special attacks can be
+	-- introduced for a particular combatant without mutating the default
+	-- attack definitions shared by the game.
+	self.Attacks[index] =
+		attack
+end
+
+--============================================================
+-- STATE SNAPSHOT
+--============================================================
+
+function CombatController:GetState(): CombatState
+
+	-- Return a new table rather than exposing self.State directly.
+	-- External systems can inspect combat state without receiving a
+	-- mutable reference that could bypass the controller's transitions.
+	return {
+		Combo = self.State.Combo,
+
+		LastAttackTime =
+			self.State.LastAttackTime,
+
+		Attacking =
+			self.State.Attacking,
+
+		Blocking =
+			self.State.Blocking,
+
+		StunnedUntil =
+			self.State.StunnedUntil,
+
+		AttackId =
+			self.State.AttackId,
+	}
+end
+
+--============================================================
+-- DESTROY
+--============================================================
+
+function CombatController:Destroy()
+
+	if self.Destroyed then
+		return
+	end
+
+	self.Destroyed = true
+
+	-- Invalidate pending attack stages before disconnecting anything.
+	-- This prevents delayed code from continuing to treat the controller
+	-- as an active combat participant.
+	self:CancelAttack()
+
+	self.State.Blocking = false
+
+	for _, connection in ipairs(self.Connections) do
+
+		if connection.Connected then
+			connection:Disconnect()
+		end
+	end
+
+	table.clear(
+		self.Connections
+	)
+
+	table.clear(
+		self.Attacks
+	)
+
+	self.Character:SetAttribute(
+		"Attacking",
+		false
+	)
+
+	self.Character:SetAttribute(
+		"Blocking",
+		false
+	)
+
+	self.Character:SetAttribute(
+		"Stunned",
+		false
+	)
+end
+
+--============================================================
+-- FACTORY
+--============================================================
+
+function CombatController.Create(
+	character: Model,
+	config: CombatConfig?
+)
+
+	return CombatController.new(
+		character,
+		config
+	)
+end
+
+return CombatController
